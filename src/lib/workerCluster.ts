@@ -1294,19 +1294,40 @@ export async function handleWorkerSessionEvent(node: WorkerNode, body: any): Pro
       deleteSession(sessionId);
       purgeMasterAuthCopiesForSession(sessionId);
     } else {
-      if (notifyExpiredCb && existingMeta?.status === 'connected') {
-        await notifyExpiredCb({
+      const isExpiredMeta = Boolean(existingMeta?.expires_at && Date.parse(existingMeta.expires_at) <= Date.now());
+      if (isExpiredMeta) {
+        if (notifyExpiredCb && existingMeta?.status === 'connected') {
+          await notifyExpiredCb({
+            sessionId,
+            sessionName: existingMeta?.session_name,
+            expiredPhone: resolvedPhone,
+            userId: owner?.id || existingMeta?.user_id,
+            reason: 'masa aktif tautan perangkat WhatsApp telah berakhir'
+          }).catch(() => {});
+        }
+        remoteSessionStates.delete(sessionId);
+        deleteSession(sessionId);
+        purgeMasterAuthCopiesForSession(sessionId);
+        void sendCommandToWorker(node, 'stop_session', { sessionId, purge: true }, 10000).catch(() => {});
+      } else {
+        // Temporary disconnect: mark DB disconnected (starts 24h grace window) and free worker RAM without purging auth creds
+        remoteSessionStates.set(sessionId, {
           sessionId,
-          sessionName: existingMeta?.session_name,
-          expiredPhone: resolvedPhone,
           userId: owner?.id || existingMeta?.user_id,
-          reason: 'koneksi perangkat WhatsApp terputus dan belum dapat tersambung kembali secara otomatis'
-        }).catch(() => {});
+          workerNodeId: node.id,
+          workerNodeName: node.name,
+          status: 'disconnected',
+          hasCreds: Boolean(existingMeta || body?.hasCreds),
+          qrCodeUrl: null,
+          pairingCode: null,
+          phoneNumber: resolvedPhone || null,
+          lastUpdated: Date.now()
+        });
+        if (existingMeta && existingMeta.status !== 'disconnected') {
+          updateSession(existingMeta.id, { status: 'disconnected' });
+        }
+        void sendCommandToWorker(node, 'stop_session', { sessionId, purge: false }, 10000).catch(() => {});
       }
-      remoteSessionStates.delete(sessionId);
-      deleteSession(sessionId);
-      purgeMasterAuthCopiesForSession(sessionId);
-      void sendCommandToWorker(node, 'stop_session', { sessionId, purge: true }, 10000).catch(() => {});
     }
     return { ok: true };
   }
@@ -2500,7 +2521,7 @@ export function scheduleWorkerDormantDetach(node: WorkerNode, sessionId: string,
     const isSessExpired = Boolean(dbSess?.expires_at && Date.parse(dbSess.expires_at) <= Date.now());
     if (owner && isUserAutoReplyAllowed(owner) && !isSessExpired) return;
     remoteSessionStates.delete(sessionId);
-    void sendCommandToWorker(node, 'stop_session', { sessionId, purge: true }, 12000).catch(() => {});
+    void sendCommandToWorker(node, 'stop_session', { sessionId, purge: false }, 12000).catch(() => {});
   }, delayMs);
   t.unref?.();
   workerDormantDetachTimers.set(sessionId, t);

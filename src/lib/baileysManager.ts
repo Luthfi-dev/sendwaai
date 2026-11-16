@@ -189,11 +189,15 @@ const ephemeralSendOnlySessions = new Set<string>();
 const inFlightExpiryAlerts = new Set<string>();
 const AUTH_DIR = path.resolve(process.cwd(), 'baileys_auth_sessions');
 const UNSCANNED_HANDSHAKE_TTL_MS = 3 * 60 * 1000;
+const DISCONNECTED_EMPTY_GRACE_MS = 15 * 60 * 1000;
+const DISCONNECTED_REGISTERED_GRACE_MS = 24 * 60 * 60 * 1000;
+const WATCHDOG_HEAL_COOLDOWN_MS = 5 * 60 * 1000;
 const MAX_RECONNECT_RETRIES = 5;
 const AUTH_BACKUP_DEBOUNCE_MS = 30000;
 const AUTH_BACKUP_COOLDOWN_MS = 120000;
 const PRUNE_COOLDOWN_MS = 30000;
 const MYSQL_AUTH_PRUNE_INTERVAL_MS = 10 * 60 * 1000;
+const lastWatchdogHealAt = new Map<string, number>();
 
 function extractPhoneDigitsFromText(text?: string | null): string {
   if (!text) return '';
@@ -2286,11 +2290,11 @@ export async function getOrStartBaileysSession(
           }
           if (sessionData.retryCount > MAX_RECONNECT_RETRIES) {
             if (isRegistered) {
-              console.warn(`[Baileys Keep-Alive] Sesi terdaftar ${sessionId} mencapai batas retry cepat (${MAX_RECONNECT_RETRIES}x). Menyimpan kredensial untuk pemulihan watchdog otomatis.`);
-              sessionData.status = 'disconnected';
-              sessionData.disconnectedSince = sessionData.disconnectedSince || Date.now();
-              sessionData.retryCount = 0;
-              activeSessions.set(sessionId, sessionData);
+              console.warn(`[Baileys Keep-Alive] Sesi terdaftar ${sessionId} mencapai batas retry cepat (${MAX_RECONNECT_RETRIES}x). Melepas socket dari memori & mempertahankan kredensial (masa tenggang 24 jam).`);
+              if (dbSessForRetry && dbSessForRetry.status !== 'disconnected') {
+                updateSession(dbSessForRetry.id, { status: 'disconnected' });
+              }
+              await detachLocalBaileysSocketWithoutPurge(sessionId).catch(() => {});
               return;
             }
             console.warn(`[Baileys Auto-Purge] Sesi ${sessionId} gagal reconnect ${MAX_RECONNECT_RETRIES}x. Menghapus sesi tidak aktif...`);
@@ -2556,11 +2560,11 @@ export async function requestBaileysPairingCode(
       }
       if (sessionData.retryCount > MAX_RECONNECT_RETRIES) {
         if (isRegistered) {
-          console.warn(`[Baileys Pairing Keep-Alive] Sesi terdaftar ${sessionId} menyimpan kredensial untuk pemulihan watchdog.`);
-          sessionData.status = 'disconnected';
-          sessionData.disconnectedSince = sessionData.disconnectedSince || Date.now();
-          sessionData.retryCount = 0;
-          activeSessions.set(sessionId, sessionData);
+          console.warn(`[Baileys Pairing Keep-Alive] Sesi terdaftar ${sessionId} mencapai batas retry cepat. Melepas socket dari memori & mempertahankan kredensial (masa tenggang 24 jam).`);
+          if (dbSessPairRetry && dbSessPairRetry.status !== 'disconnected') {
+            updateSession(dbSessPairRetry.id, { status: 'disconnected' });
+          }
+          await detachLocalBaileysSocketWithoutPurge(sessionId).catch(() => {});
           return;
         }
         await purgeBaileysSessionCompletely(sessionId, cleanPhone);
@@ -3107,24 +3111,41 @@ export async function pruneInactiveAndUnregisteredBaileysSessions(force = false)
         const updatedMs = new Date(s.updated_at || s.created_at || 0).getTime();
 
         if (s.status === 'disconnected' && !hasOpenSocket && !hasRemoteLive) {
+          const hasDiskCreds = hasRegisteredCredsOnDisk(s.id);
           let hasMysqlCreds = false;
-          if (isMysqlConfigured() && !hasRegisteredCredsOnDisk(s.id)) {
+          if (!hasDiskCreds && isMysqlConfigured()) {
             const authData = await loadBaileysAuthFromMysql(s.id).catch(() => null);
             hasMysqlCreds = Boolean(authData && authData['creds.json']);
           }
-          const staleDisconnected = !withinStartupGrace && now - updatedMs > 60_000;
-          if (staleDisconnected || (!hasRegisteredCredsOnDisk(s.id) && !hasMysqlCreds)) {
+          const hasValidCreds = hasDiskCreds || hasMysqlCreds;
+          const disconnectedElapsedMs = now - updatedMs;
+          const graceWindowMs = hasValidCreds ? DISCONNECTED_REGISTERED_GRACE_MS : DISCONNECTED_EMPTY_GRACE_MS;
+
+          if (!withinStartupGrace && disconnectedElapsedMs > graceWindowMs) {
             if (s.phone_number && s.connected_at) {
               await notifyUserSessionExpired({
                 sessionId: s.id,
                 sessionName: s.session_name,
                 expiredPhone: s.phone_number,
                 userId: s.user_id,
-                reason: 'tautan perangkat WhatsApp telah terputus sehingga perlu ditautkan ulang'
+                reason: hasValidCreds
+                  ? 'koneksi perangkat WhatsApp terputus lebih dari 24 jam sehingga perlu ditautkan ulang'
+                  : 'tautan perangkat WhatsApp telah terputus dan kredensialnya sudah tidak tersedia'
               }).catch(() => {});
             }
-            await doPurge(s.id, s.phone_number, 'sesi terputus / tidak aktif');
+            await doPurge(
+              s.id,
+              s.phone_number,
+              hasValidCreds
+                ? 'sesi terputus melewati masa tenggang 24 jam'
+                : 'sesi terputus tanpa kredensial (>15 menit)'
+            );
             continue;
+          }
+
+          // While inside grace window, ensure idle disconnected local socket is detached to keep RAM free
+          if (mem && !isSocketTrulyOpen(mem.socket) && mem.status === 'disconnected') {
+            await detachLocalBaileysSocketWithoutPurge(s.id).catch(() => {});
           }
         }
 
@@ -3170,9 +3191,14 @@ export async function pruneInactiveAndUnregisteredBaileysSessions(force = false)
     if (
       mem.status === 'disconnected' &&
       !isSocketTrulyOpen(mem.socket) &&
-      (!summary.registered || now - (mem.disconnectedSince || mem.lastUpdated) > 180_000)
+      now - (mem.disconnectedSince || mem.lastUpdated) > 180_000
     ) {
-      await doPurge(sid, mem.phoneNumber || summary.phone, 'socket terputus tidak aktif');
+      if (!summary.registered) {
+        await doPurge(sid, mem.phoneNumber || summary.phone, 'socket terputus tanpa kredensial');
+      } else {
+        // Free socket memory without deleting credentials during 24h grace period
+        await detachLocalBaileysSocketWithoutPurge(sid).catch(() => {});
+      }
       continue;
     }
   }
@@ -3535,7 +3561,7 @@ export async function teardownAutoReplyBaileysForUser(userId: string): Promise<n
   for (const sid of targetSessionIds) {
     const detached = await detachLocalBaileysSocketWithoutPurge(sid);
     if (detached) stoppedCount++;
-    const workerStopped = await stopSessionOnWorker(sid, true).catch(() => false);
+    const workerStopped = await stopSessionOnWorker(sid, false).catch(() => false);
     if (workerStopped) stoppedCount++;
   }
 
@@ -3788,9 +3814,17 @@ export async function runBaileysPeriodicHealthCheck(): Promise<{
   const hasEnabledWorker = getWorkerNodes().some(n => n.status !== 'disabled' && n.is_verified);
   const dbSessions = getWhatsAppSessions();
   for (const s of dbSessions) {
-    if (!s.id || s.status !== 'connected') continue;
+    if (!s.id || (s.status !== 'connected' && s.status !== 'disconnected')) continue;
+    if (s.expires_at && Date.parse(s.expires_at) <= now) continue;
     if (s.worker_node_id && s.worker_node_id !== 'local') continue;
     if (!localEnabled) continue;
+
+    if (s.status === 'disconnected') {
+      const updatedMs = new Date(s.updated_at || s.created_at || 0).getTime();
+      if (now - updatedMs >= DISCONNECTED_REGISTERED_GRACE_MS) continue;
+      const lastHeal = lastWatchdogHealAt.get(s.id) || 0;
+      if (now - lastHeal < WATCHDOG_HEAL_COOLDOWN_MS) continue;
+    }
 
     const owner = resolveActiveVerifiedOwner(s.id, s.user_id, s.phone_number);
     if (!isOwnerActiveAndRegistered(owner)) continue;
@@ -3824,15 +3858,9 @@ export async function runBaileysPeriodicHealthCheck(): Promise<{
       if (hasEnabledWorker) {
         continue;
       }
-      updateSession(s.id, { status: 'disconnected' });
-      const alertRes = await notifyUserSessionExpired({
-        sessionId: s.id,
-        sessionName: s.session_name,
-        expiredPhone: s.phone_number,
-        userId: owner!.id,
-        reason: 'tautan perangkat WhatsApp sudah tidak aktif sehingga perlu disambungkan ulang'
-      }).catch(() => ({ notified: false }));
-      if (alertRes.notified) notified++;
+      if (s.status !== 'disconnected') {
+        updateSession(s.id, { status: 'disconnected' });
+      }
       continue;
     }
 
@@ -3847,11 +3875,12 @@ export async function runBaileysPeriodicHealthCheck(): Promise<{
         sessionName: s.session_name,
         expiredPhone: s.phone_number,
         userId: owner!.id,
-        reason: 'koneksi perangkat WhatsApp terputus dan belum dapat tersambung kembali secara otomatis'
+        reason: 'koneksi perangkat WhatsApp terputus dan sedang dicoba sambungkan kembali secara otomatis'
       }).catch(() => ({ notified: false }));
       if (alertRes.notified) notified++;
     }
 
+    lastWatchdogHealAt.set(s.id, now);
     console.log(
       `[Baileys Watchdog] Auto-healing session ${s.id} (${s.phone_number || 'active'})...`
     );

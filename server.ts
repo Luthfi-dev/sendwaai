@@ -3768,19 +3768,26 @@ app.get('/api/sessions', requireAuth, async (req, res) => {
   await hydrateMissingSessionCredsFromMysql(scopeUserId).catch(() => 0);
   reconcileLiveAndRegisteredSessions(scopeUserId);
 
-  // Immediately kill & remove any expired or stale-disconnected sessions so resources are never wasted
+  // Immediately kill & remove expired sessions, or disconnected sessions that have exceeded their grace window
   const nowCheckMs = Date.now();
+  const DISCONNECTED_REGISTERED_GRACE_MS = 24 * 60 * 60 * 1000;
+  const DISCONNECTED_EMPTY_GRACE_MS = 15 * 60 * 1000;
   const prePurgeSessions =
     authUser.role === 'admin' && showAll
       ? getWhatsAppSessions()
       : getSessionsByUserId(authUser.id);
   const expiredOrDead = prePurgeSessions.filter(s => {
     const isExp = Boolean(s.expires_at && Date.parse(s.expires_at) <= nowCheckMs);
-    const isDeadDisc =
-      s.status === 'disconnected' &&
-      getLiveSessionRuntimeStatus(s).runtime_status === 'disconnected' &&
-      nowCheckMs - new Date(s.updated_at || s.created_at || 0).getTime() > 60_000;
-    return isExp || isDeadDisc;
+    if (isExp) return true;
+    const rt = getLiveSessionRuntimeStatus(s);
+    if (s.status === 'disconnected' && rt.runtime_status === 'disconnected') {
+      const disconnectedMs = nowCheckMs - new Date(s.updated_at || s.created_at || 0).getTime();
+      const graceMs = rt.has_registered_creds
+        ? DISCONNECTED_REGISTERED_GRACE_MS
+        : DISCONNECTED_EMPTY_GRACE_MS;
+      return disconnectedMs > graceMs;
+    }
+    return false;
   });
   for (const deadSess of expiredOrDead) {
     await stopBaileysSession(deadSess.id).catch(() => {});
