@@ -58,6 +58,7 @@ export interface MetaAiQueryParams {
   customerHistory?: MetaAiCustomerTurn[];
   orderSummary?: string;
   paymentSummary?: string;
+  allowDormantWake?: boolean;
 }
 
 export interface MetaAiQueryResult {
@@ -104,7 +105,11 @@ interface PendingWaiter {
 
 type ConnectedSocketProvider = (userId?: string, preferredSessionId?: string) => ConnectedSocketEntry | null;
 type AllConnectedSocketsProvider = () => ConnectedSocketEntry[];
-type EnsureConnectedSocketProvider = (userId?: string, preferredSessionId?: string) => Promise<ConnectedSocketEntry | null>;
+type EnsureConnectedSocketProvider = (
+  userId?: string,
+  preferredSessionId?: string,
+  options?: { allowDormantSendOnly?: boolean }
+) => Promise<ConnectedSocketEntry | null>;
 
 let socketProvider: ConnectedSocketProvider | null = null;
 let allSocketsProvider: AllConnectedSocketsProvider | null = null;
@@ -238,7 +243,8 @@ export function registerConnectedSocketProvider(
 
 export async function ensureConnectedMetaAiSocketForUser(
   userId?: string,
-  preferredSessionId?: string
+  preferredSessionId?: string,
+  options?: { allowDormantSendOnly?: boolean }
 ): Promise<ConnectedSocketEntry | null> {
   const existing = socketProvider ? socketProvider(userId, preferredSessionId) : null;
   if (existing && isSocketOpen(existing.socket)) {
@@ -246,7 +252,7 @@ export async function ensureConnectedMetaAiSocketForUser(
   }
   if (ensureSocketProvider) {
     try {
-      const ensured = await ensureSocketProvider(userId, preferredSessionId);
+      const ensured = await ensureSocketProvider(userId, preferredSessionId, options);
       if (ensured && isSocketOpen(ensured.socket)) {
         return ensured;
       }
@@ -1757,6 +1763,8 @@ function isSocketOpen(socket: any): boolean {
   if (!socket || (typeof socket.sendMessage !== 'function' && typeof socket.relayMessage !== 'function')) return false;
   if (socket.ws) {
     if (typeof socket.ws.isOpen === 'boolean') return socket.ws.isOpen;
+    const innerRs = socket.ws.socket?.readyState;
+    if (typeof innerRs === 'number') return innerRs === 1;
     if (typeof socket.ws.readyState === 'number') return socket.ws.readyState === 1;
   }
   return Boolean(socket.user?.id);
@@ -1842,7 +1850,7 @@ async function ensureBotDeviceCached(socket: any, targetJid: string): Promise<vo
     if (existingDevices.length === 0 && typeof socket.getUSyncDevices === 'function') {
       existingDevices = await Promise.race([
         socket.getUSyncDevices([targetJid], true, false),
-        new Promise<any[]>((resolve) => setTimeout(() => resolve([]), 3500))
+        new Promise<any[]>((resolve) => setTimeout(() => resolve([]), 2500))
       ]).catch(() => []);
     }
     const hasTarget = Array.isArray(existingDevices) && existingDevices.some((d: any) => d?.user === decoded.user);
@@ -1857,6 +1865,96 @@ async function ensureBotDeviceCached(socket: any, targetJid: string): Promise<vo
   } catch {
     // Non-fatal cache check
   }
+}
+
+async function ensurePnDeviceAndSession(socket: any, targetJid: string): Promise<boolean> {
+  if (targetJid.endsWith('@bot')) return true;
+  const decoded = jidDecode(targetJid);
+  if (!decoded?.user) return false;
+  const repo = socket?.signalRepository;
+  let hasSession = false;
+
+  if (repo?.validateSession) {
+    try {
+      const val = await repo.validateSession(targetJid);
+      hasSession = Boolean(val?.exists);
+    } catch {
+      hasSession = false;
+    }
+  }
+
+  if (!hasSession && typeof socket?.assertSessions === 'function') {
+    try {
+      await Promise.race([
+        socket.assertSessions([targetJid]),
+        new Promise((resolve) => setTimeout(resolve, 4000))
+      ]);
+      if (repo?.validateSession) {
+        const recheck = await repo.validateSession(targetJid);
+        hasSession = Boolean(recheck?.exists);
+      }
+    } catch {
+      // Fallback to direct prekey IQ below
+    }
+  }
+
+  if (!hasSession && typeof socket?.query === 'function' && repo) {
+    try {
+      const res = await Promise.race([
+        socket.query(
+          {
+            tag: 'iq',
+            attrs: { xmlns: 'encrypt', type: 'get', to: S_WHATSAPP_NET },
+            content: [{ tag: 'key', attrs: {}, content: [{ tag: 'user', attrs: { jid: targetJid } }] }]
+          },
+          4500
+        ),
+        new Promise<null>((_, reject) => setTimeout(() => reject(new Error('Timeout query prekey PN')), 4500))
+      ]);
+      if (res) {
+        await parseAndInjectE2ESessions(res, repo);
+        if (repo.validateSession) {
+          const recheck = await repo.validateSession(targetJid);
+          hasSession = Boolean(recheck?.exists);
+        } else {
+          hasSession = true;
+        }
+      }
+    } catch {
+      // Best-effort PN prekey fetch
+    }
+  }
+
+  // Ensure Baileys relayMessage doesn't strip device 0 when USync returns empty device list
+  if (socket?.userDevicesCache?.set) {
+    try {
+      let existingDevices: any[] = [];
+      if (typeof socket.userDevicesCache.get === 'function') {
+        const cached = await socket.userDevicesCache.get(decoded.user).catch(() => undefined);
+        if (Array.isArray(cached)) existingDevices = cached;
+      }
+      if (existingDevices.length === 0 && typeof socket.getUSyncDevices === 'function') {
+        existingDevices = await Promise.race([
+          socket.getUSyncDevices([targetJid], true, false),
+          new Promise<any[]>((resolve) => setTimeout(() => resolve([]), 2500))
+        ]).catch(() => []);
+      }
+      if (!Array.isArray(existingDevices) || existingDevices.length === 0) {
+        const server = decoded.server === 'lid' ? 'lid' : 's.whatsapp.net';
+        const domainType = decoded.server === 'lid' ? 1 : 0;
+        const deviceRecord = [{ user: decoded.user, device: 0, domainType, server }];
+        if (typeof socket.userDevicesCache.mset === 'function') {
+          await socket.userDevicesCache.mset([{ key: decoded.user, value: deviceRecord }]);
+        } else {
+          await socket.userDevicesCache.set(decoded.user, deviceRecord);
+        }
+      }
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  return hasSession;
 }
 
 async function ensureBotSignalSessionAndDevice(sessionId: string, socket: any, targetJid: string): Promise<boolean> {
@@ -1885,36 +1983,53 @@ async function ensureBotSignalSessionAndDevice(sessionId: string, socket: any, t
   }
 
   if (!hasSession && typeof socket?.query === 'function' && repo) {
-    try {
-      const res = await Promise.race([
-        socket.query({
-          tag: 'iq',
-          attrs: {
-            xmlns: 'encrypt',
-            type: 'get',
-            to: S_WHATSAPP_NET
-          },
-          content: [
+    const queryPrekey = async (userAttrs: Record<string, string>, timeoutMs: number): Promise<{ timedOut: boolean; ok: boolean }> => {
+      try {
+        const res = await Promise.race([
+          socket.query(
             {
-              tag: 'key',
-              attrs: {},
-              content: [{ tag: 'user', attrs: { jid: targetJid } }]
-            }
-          ]
-        }),
-        new Promise<null>((_, reject) => setTimeout(() => reject(new Error('Timeout query prekey Meta AI')), 6000))
-      ]);
-      if (res) {
-        await parseAndInjectE2ESessions(res, repo);
-        if (repo.validateSession) {
-          const recheck = await repo.validateSession(targetJid);
-          hasSession = Boolean(recheck?.exists);
-        } else {
-          hasSession = true;
+              tag: 'iq',
+              attrs: {
+                xmlns: 'encrypt',
+                type: 'get',
+                to: S_WHATSAPP_NET
+              },
+              content: [
+                {
+                  tag: 'key',
+                  attrs: {},
+                  content: [{ tag: 'user', attrs: userAttrs }]
+                }
+              ]
+            },
+            timeoutMs
+          ),
+          new Promise<null>((_, reject) => setTimeout(() => reject(new Error('Timeout query prekey Meta AI')), timeoutMs))
+        ]);
+        if (res) {
+          await parseAndInjectE2ESessions(res, repo);
+          if (repo.validateSession) {
+            const recheck = await repo.validateSession(targetJid);
+            return { timedOut: false, ok: Boolean(recheck?.exists) };
+          }
+          return { timedOut: false, ok: true };
         }
+        return { timedOut: false, ok: false };
+      } catch (err: any) {
+        const msg = String(err?.message || err || '');
+        const timedOut = /timeout|timed out/i.test(msg);
+        console.warn(`[Meta AI Session] Gagal fetch prekey untuk ${userAttrs.jid}: ${msg}`);
+        return { timedOut, ok: false };
       }
-    } catch (err: any) {
-      console.warn(`[Meta AI Session] Gagal fetch prekey untuk ${targetJid}: ${err?.message || err}`);
+    };
+
+    const firstAttempt = await queryPrekey({ jid: targetJid }, 4500);
+    hasSession = firstAttempt.ok;
+
+    // Only retry with reason="identity" when server answered quickly with empty/error (not on timeout)
+    if (!hasSession && !firstAttempt.timedOut) {
+      const secondAttempt = await queryPrekey({ jid: targetJid, reason: 'identity' }, 3500);
+      hasSession = secondAttempt.ok;
     }
   }
 
@@ -1935,8 +2050,19 @@ export async function resolveMetaAiCandidateJids(sessionId: string, socket: any)
     ordered.push(preferred);
   }
 
-  // 1. Discover official `@bot` entries registered on this WhatsApp account (typically 867051314767696@bot)
-  const bots = await fetchAccountBotList(sessionId, socket);
+  // Run bot list, Signal LID lookup, and USync lookup in parallel to avoid multi-second serial stalls
+  const [botsRes, signalLidRes, usyncRes] = await Promise.allSettled([
+    fetchAccountBotList(sessionId, socket),
+    lookupMetaAiLidViaSignal(sessionId, socket),
+    !sessionMetaAiLids.has(sessionId) && typeof socket?.getUSyncDevices === 'function'
+      ? Promise.race([
+          socket.getUSyncDevices(['13135550002@s.whatsapp.net'], false, false),
+          new Promise<any[]>((resolve) => setTimeout(() => resolve([]), 2500))
+        ])
+      : Promise.resolve([])
+  ]);
+
+  const bots = botsRes.status === 'fulfilled' ? botsRes.value : [];
   const cachedEntry = sessionBotEntries.get(sessionId);
   const accountExplicitlyListedNoBots = Boolean(cachedEntry && cachedEntry.entries.length === 0);
 
@@ -1948,16 +2074,29 @@ export async function resolveMetaAiCandidateJids(sessionId: string, socket: any)
     ordered.push(bot.jid);
   }
 
-  // 2. Discover learned or Signal-mapped `@lid`
-  let discoveredLid: string | null = sessionMetaAiLids.get(sessionId) || null;
-  if (!discoveredLid) {
-    discoveredLid = await lookupMetaAiLidViaSignal(sessionId, socket);
+  let discoveredLid: string | null =
+    sessionMetaAiLids.get(sessionId) ||
+    (signalLidRes.status === 'fulfilled' ? signalLidRes.value : null) ||
+    null;
+
+  if (!discoveredLid && usyncRes.status === 'fulfilled' && Array.isArray(usyncRes.value)) {
+    const lidDevice = usyncRes.value.find((d: any) => typeof d?.jid === 'string' && d.jid.endsWith('@lid'));
+    if (lidDevice?.jid) {
+      const cleanLid = safeNormalizeJid(lidDevice.jid);
+      if (isRoutableOutgoingMetaJid(cleanLid)) {
+        rememberSessionMetaAiLid(sessionId, cleanLid);
+        discoveredLid = cleanLid;
+      }
+    } else {
+      discoveredLid = await lookupMetaAiLidViaSignal(sessionId, socket);
+    }
   }
+
   if (!discoveredLid && typeof socket?.onWhatsApp === 'function') {
     try {
       const checkRes = await Promise.race([
         socket.onWhatsApp('13135550002'),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500))
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000))
       ]);
       if (Array.isArray(checkRes) && checkRes[0]) {
         const resolved = checkRes[0]?.lid || checkRes[0]?.jid;
@@ -1996,7 +2135,9 @@ export async function resolveMetaAiCandidateJids(sessionId: string, socket: any)
 
   const dedupedValid = Array.from(new Set(ordered.filter((j) => isRoutableOutgoingMetaJid(j))));
   const nonRejected = dedupedValid.filter((j) => !isSessionBotJidRejected(sessionId, j));
-  return nonRejected.length > 0 ? nonRejected : dedupedValid;
+  const rejected = dedupedValid.filter((j) => isSessionBotJidRejected(sessionId, j));
+  // Keep rejected candidates at the tail as last-resort fallbacks so a single failed JID never strands the request
+  return [...nonRejected, ...rejected];
 }
 
 async function simulateHumanMetaTyping(socket: any, targetJid: string, promptText: string): Promise<void> {
@@ -2208,21 +2349,58 @@ export async function sendBotDirectStanza(
   return true;
 }
 
+export async function sendBotPlaintextStanza(
+  socket: any,
+  targetJid: string,
+  waMessage: proto.IMessage,
+  msgId: string
+): Promise<boolean> {
+  if (!targetJid.endsWith('@bot') || typeof socket?.sendNode !== 'function') return false;
+  const stanza = {
+    tag: 'message',
+    attrs: {
+      id: msgId,
+      to: targetJid,
+      type: 'text'
+    },
+    content: [
+      {
+        tag: 'plaintext',
+        attrs: {},
+        content: encodeWAMessage(waMessage)
+      }
+    ]
+  };
+  await socket.sendNode(stanza);
+  try {
+    socket?.messageRetryManager?.addRecentMessage?.(targetJid, msgId, waMessage);
+  } catch {
+    // Non-fatal retry cache update
+  }
+  return true;
+}
+
 async function sendPromptToSingleJid(
   sessionId: string,
   socket: any,
   targetJid: string,
   promptText: string,
-  waiter?: PendingWaiter
+  waiter?: PendingWaiter,
+  options?: { allowPlaintextBotFallback?: boolean }
 ): Promise<string> {
   const isBotDomain = targetJid.endsWith('@bot');
   const messageSecret = crypto.randomBytes(32);
 
+  let botSignalReady = true;
   if (isBotDomain) {
-    const sessionOk = await ensureBotSignalSessionAndDevice(sessionId, socket, targetJid);
-    if (!sessionOk) {
-      throw new Error(`Sesi Signal ke ${targetJid} tidak tersedia dari server WhatsApp.`);
+    botSignalReady = await ensureBotSignalSessionAndDevice(sessionId, socket, targetJid);
+    if (!botSignalReady && !options?.allowPlaintextBotFallback) {
+      throw new Error(
+        `Sesi enkripsi Meta AI (${targetJid}) belum tersedia dari server WhatsApp. Pastikan akun ini sudah pernah memulai chat dengan Meta AI di WhatsApp HP.`
+      );
     }
+  } else {
+    await ensurePnDeviceAndSession(socket, targetJid);
   }
 
   const userJid = socket?.authState?.creds?.me?.id || socket?.user?.id || '';
@@ -2268,19 +2446,27 @@ async function sendPromptToSingleJid(
     sessionLastPromptAt.set(sessionId, Date.now());
     let sentViaDirectBot = false;
     if (isBotDomain && fullMsg.message) {
-      try {
+      if (botSignalReady) {
+        try {
+          sentViaDirectBot = await Promise.race([
+            sendBotDirectStanza(socket, targetJid, fullMsg.message, msgId),
+            new Promise<boolean>((_, reject) =>
+              setTimeout(() => reject(new Error('Timeout mengirim prompt ke Meta AI')), 10000)
+            )
+          ]);
+        } catch (directErr) {
+          if (directErr instanceof Error && directErr.message.includes('Timeout mengirim prompt')) {
+            throw directErr;
+          }
+          sentViaDirectBot = false;
+        }
+      } else if (options?.allowPlaintextBotFallback) {
         sentViaDirectBot = await Promise.race([
-          sendBotDirectStanza(socket, targetJid, fullMsg.message, msgId),
+          sendBotPlaintextStanza(socket, targetJid, fullMsg.message, msgId),
           new Promise<boolean>((_, reject) =>
             setTimeout(() => reject(new Error('Timeout mengirim prompt ke Meta AI')), 10000)
           )
         ]);
-      } catch (directErr) {
-        // Re-throw timeout/sendNode failures; otherwise fall back to Baileys relayMessage
-        if (directErr instanceof Error && directErr.message.includes('Timeout mengirim prompt')) {
-          throw directErr;
-        }
-        sentViaDirectBot = false;
       }
     }
 
@@ -2332,7 +2518,9 @@ async function sendPromptToMetaAi(
   for (let i = 0; i < candidates.length; i++) {
     const targetJid = candidates[i];
     try {
-      const usedJid = await sendPromptToSingleJid(sessionId, socket, targetJid, promptText, waiter);
+      const usedJid = await sendPromptToSingleJid(sessionId, socket, targetJid, promptText, waiter, {
+        allowPlaintextBotFallback: false
+      });
       return {
         usedJid,
         remainingCandidates: candidates.slice(i + 1)
@@ -2341,6 +2529,21 @@ async function sendPromptToMetaAi(
       lastError = err;
     }
   }
+
+  // Last-resort plaintext `@bot` stanza when Signal prekeys are not published by WA shard
+  const botTarget = candidates.find((j) => j.endsWith('@bot')) || DEFAULT_META_AI_BOT_JID;
+  try {
+    const usedJid = await sendPromptToSingleJid(sessionId, socket, botTarget, promptText, waiter, {
+      allowPlaintextBotFallback: true
+    });
+    return {
+      usedJid,
+      remainingCandidates: []
+    };
+  } catch (plaintextErr) {
+    if (!lastError) lastError = plaintextErr;
+  }
+
   if (lastError) {
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
@@ -2623,7 +2826,12 @@ export async function askMetaAiViaBaileys(
     };
   }
 
-  const entry = socketProvider(params.userId, params.sessionId);
+  let entry = socketProvider(params.userId, params.sessionId);
+  if (!entry || !isSocketOpen(entry.socket)) {
+    entry = await ensureConnectedMetaAiSocketForUser(params.userId, params.sessionId, {
+      allowDormantSendOnly: params.allowDormantWake
+    });
+  }
   if (!entry || !isSocketOpen(entry.socket)) {
     return {
       replyText: fallbackReply,
@@ -2703,7 +2911,12 @@ export async function askMetaAiViaBaileys(
 
   try {
     const queryResult = await enqueueSessionTask(entry.sessionId, async () => {
-      const liveEntry = socketProvider ? socketProvider(params.userId, entry.sessionId) : null;
+      let liveEntry = socketProvider ? socketProvider(params.userId, entry.sessionId) : null;
+      if (!liveEntry || !isSocketOpen(liveEntry.socket)) {
+        liveEntry = await ensureConnectedMetaAiSocketForUser(params.userId, entry.sessionId, {
+          allowDormantSendOnly: params.allowDormantWake
+        });
+      }
       if (!liveEntry || !isSocketOpen(liveEntry.socket)) {
         return { ok: false, reason: 'Perangkat WhatsApp terputus sebelum mengirim ke Meta AI.' };
       }

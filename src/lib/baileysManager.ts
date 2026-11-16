@@ -688,16 +688,28 @@ export async function ensureConnectedSessionForUser(
         }
       }
 
-      const sortedDb = [...userDbSessions]
-        .filter(s => {
-          const notExpired = !s.expires_at || new Date(s.expires_at).getTime() >= Date.now();
-          return notExpired && s.status !== 'disconnected';
-        })
+      const nonExpiredDb = userDbSessions.filter(s => {
+        return !s.expires_at || new Date(s.expires_at).getTime() >= Date.now();
+      });
+
+      const activeSortedDb = nonExpiredDb
+        .filter(s => s.status !== 'disconnected')
         .sort((a, b) => Number(Boolean(b.is_primary)) - Number(Boolean(a.is_primary)));
 
-      for (const s of sortedDb) {
+      for (const s of activeSortedDb) {
         addCandidate(s.id, s.phone_number, s.user_id || userId);
       }
+
+      // Include temporarily disconnected sessions within 24h grace period if registered creds still exist
+      const dormantGraceDb = nonExpiredDb
+        .filter(s => s.status === 'disconnected' && hasRegisteredCredsOnDisk(s.id))
+        .sort((a, b) => Number(Boolean(b.is_primary)) - Number(Boolean(a.is_primary)));
+
+      for (const s of dormantGraceDb) {
+        addCandidate(s.id, s.phone_number, s.user_id || userId);
+      }
+
+      const sortedDb = [...activeSortedDb, ...dormantGraceDb];
 
       // 3. Also inspect registered disk auth folders matching user's DB session phone
       if (userId && fs.existsSync(AUTH_DIR) && sortedDb.length > 0) {

@@ -10,6 +10,7 @@ import {
   markUserMetaAiVerified,
   isPhoneMetaAiVerifiedForUser,
   getSessionById,
+  getSessionsByUserId,
   resolveEffectiveSessionAiSettings,
   isUserAutoReplyAllowed,
   enforceFreeAutoReplyExpirationForUser
@@ -19,6 +20,7 @@ import {
   askMetaAiViaBaileys,
   buildMetaAiPrompt,
   cleanMetaAiReply,
+  ensureConnectedMetaAiSocketForUser,
   getMetaAiAvailabilityForUser,
   reconcileCatalogImageLinksInReply,
   type MetaAiQueryParams
@@ -59,7 +61,25 @@ async function executeMetaAiWithWorkerFallback(queryParams: MetaAiQueryParams): 
     };
   }
 
-  const remoteRt = findRemoteConnectedSessionForUser(queryParams.userId, queryParams.sessionId);
+  let remoteRt = findRemoteConnectedSessionForUser(queryParams.userId, queryParams.sessionId);
+  if (!remoteRt) {
+    // Wake dormant registered local session or wait briefly if socket is reconnecting
+    await ensureConnectedMetaAiSocketForUser(queryParams.userId, queryParams.sessionId, {
+      allowDormantSendOnly: queryParams.allowDormantWake
+    }).catch(() => null);
+    const refreshedLocal = getMetaAiAvailabilityForUser(queryParams.userId, queryParams.sessionId);
+    if (refreshedLocal.connected) {
+      const res = await askMetaAiViaBaileys(queryParams);
+      return {
+        usedAi: res.usedAi,
+        replyText: res.replyText,
+        errorReason: res.errorReason,
+        phoneNumber: refreshedLocal.phoneNumber
+      };
+    }
+    remoteRt = findRemoteConnectedSessionForUser(queryParams.userId, queryParams.sessionId);
+  }
+
   if (remoteRt) {
     const node = getPinnedAliveWorkerForSession(remoteRt.sessionId);
     if (node) {
@@ -190,7 +210,18 @@ export async function simulateAutoReplyForTest(params: {
   const sysConfig = getSystemConfig();
   if (userId) enforceFreeAutoReplyExpirationForUser(userId);
   const user = userId ? getUserById(userId) : null;
-  const targetSession = sessionId ? getSessionById(sessionId) : null;
+  let targetSession = sessionId ? getSessionById(sessionId) : null;
+  if (!targetSession && userId) {
+    const owned = getSessionsByUserId(userId).filter(
+      s => !s.expires_at || new Date(s.expires_at).getTime() >= Date.now()
+    );
+    targetSession =
+      owned.find(s => s.status !== 'disconnected' && s.is_primary) ||
+      owned.find(s => s.status !== 'disconnected') ||
+      owned.find(s => s.is_primary) ||
+      owned[0] ||
+      null;
+  }
   const effectiveAi = resolveEffectiveSessionAiSettings({
     user,
     session: targetSession,
@@ -250,7 +281,8 @@ export async function simulateAutoReplyForTest(params: {
           customerCode: orderFlow.context.customerCode,
           customerHistory: priorHistory,
           orderSummary: orderFlow.orderSummaryForPrompt || undefined,
-          paymentSummary: orderFlow.paymentSummaryForPrompt || undefined
+          paymentSummary: orderFlow.paymentSummaryForPrompt || undefined,
+          allowDormantWake: true
         });
 
         if (aiResult.usedAi && aiResult.replyText) {
