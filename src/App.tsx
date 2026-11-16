@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, Suspense, lazy } from 'react';
 import { apiFetch } from './lib/csrfFetch';
 import { DEFAULT_PUBLIC_LOGO_URL, resolveLogoUrl } from './lib/branding';
 import {
@@ -49,21 +49,22 @@ import {
 import { Header } from './components/Header';
 import { StatsCards } from './components/StatsCards';
 import { MessageLogsTable } from './components/MessageLogsTable';
-import { AutoReplyRules } from './components/AutoReplyRules';
-import { AntiBanPanel } from './components/AntiBanPanel';
-import { UserManagementPanel } from './components/UserManagementPanel';
-import { ConfigPanel } from './components/ConfigPanel';
-import { SqlSchemaViewer } from './components/SqlSchemaViewer';
-import { WhatsAppConnectPanel } from './components/WhatsAppConnectPanel';
 import { LandingPage } from './components/LandingPage';
 import { AuthModal } from './components/AuthModal';
 import { PaymentUpgradeModal } from './components/PaymentUpgradeModal';
-import { ApiDocsPanel } from './components/ApiDocsPanel';
-import { SuperadminMasterPanel } from './components/SuperadminMasterPanel';
 import { SecurityPinModal } from './components/SecurityPinModal';
-import { BroadcastPanel } from './components/BroadcastPanel';
-import { ProfilePanel } from './components/ProfilePanel';
-import { CatalogShopPanel } from './components/CatalogShopPanel';
+
+const AutoReplyRules = lazy(() => import('./components/AutoReplyRules').then(m => ({ default: m.AutoReplyRules })));
+const AntiBanPanel = lazy(() => import('./components/AntiBanPanel').then(m => ({ default: m.AntiBanPanel })));
+const UserManagementPanel = lazy(() => import('./components/UserManagementPanel').then(m => ({ default: m.UserManagementPanel })));
+const ConfigPanel = lazy(() => import('./components/ConfigPanel').then(m => ({ default: m.ConfigPanel })));
+const SqlSchemaViewer = lazy(() => import('./components/SqlSchemaViewer').then(m => ({ default: m.SqlSchemaViewer })));
+const WhatsAppConnectPanel = lazy(() => import('./components/WhatsAppConnectPanel').then(m => ({ default: m.WhatsAppConnectPanel })));
+const ApiDocsPanel = lazy(() => import('./components/ApiDocsPanel').then(m => ({ default: m.ApiDocsPanel })));
+const SuperadminMasterPanel = lazy(() => import('./components/SuperadminMasterPanel').then(m => ({ default: m.SuperadminMasterPanel })));
+const BroadcastPanel = lazy(() => import('./components/BroadcastPanel').then(m => ({ default: m.BroadcastPanel })));
+const ProfilePanel = lazy(() => import('./components/ProfilePanel').then(m => ({ default: m.ProfilePanel })));
+const CatalogShopPanel = lazy(() => import('./components/CatalogShopPanel').then(m => ({ default: m.CatalogShopPanel })));
 
 function normalizeUserClient(u: any, prev?: UserAccount | null): UserAccount {
   const emailVerified = Boolean(u?.email_verified === true || u?.email_verified === 1 || u?.email_verified === '1' || u?.email_verified === 'true');
@@ -836,7 +837,14 @@ export function App() {
             </div>
           </div>
         ) : (
-          <>
+          <Suspense
+            fallback={
+              <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-8 flex items-center justify-center gap-3 text-sm font-semibold text-slate-500 dark:text-slate-400">
+                <RefreshCw className="w-4 h-4 animate-spin text-emerald-500" />
+                <span>Memuat panel...</span>
+              </div>
+            }
+          >
             {/* TAB 0: WHATSAPP CONNECT & BARCODE / PAIRING */}
             {activeTab === 'connect' && (
               <div>
@@ -980,7 +988,7 @@ export function App() {
                 <SqlSchemaViewer />
               </div>
             )}
-          </>
+          </Suspense>
         )}
       </main>
 
